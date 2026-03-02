@@ -384,7 +384,8 @@ class SessionFiles:
                                     # 该重复事件不能再次触发“本轮结束”，否则会提前截断下一轮输出。
                                     if call_id and call_id == self._last_wait_call_id:
                                         logger.debug(
-                                            f"[{self.session_id}] 忽略重放 wait_input started 事件: call_id={call_id}"
+                                            "[%s] 忽略重放 wait_input started 事件: call_id=%s",
+                                            self.session_id, call_id,
                                         )
                                         continue
                                     if call_id:

@@ -13,6 +13,7 @@ import hashlib
 import json
 import logging
 import os
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -41,6 +42,7 @@ class SessionManager:
         self._lock = threading.Lock()
         self._cleanup_thread: Optional[threading.Thread] = None
         self._running = False
+        self._stop_event = threading.Event()
 
         # 确保 session DB 目录存在
         SESSION_DB_DIR.mkdir(parents=True, exist_ok=True)
@@ -116,24 +118,20 @@ class SessionManager:
                 # 进程已死, 需要重启
                 logger.info("[%s] Agent 进程已退出, 重启", sid)
                 agent.files.cleanup()
-                agent = None
-            else:
-                logger.debug("[%s] no existing session, will create new", sid)
 
-        # 创建新会话
-        logger.info("[%s] create new AgentProcess", sid)
-        agent = AgentProcess(
-            session_id=sid,
-            workspace=os.path.abspath(workspace),
-            model=model,
-            mode=mode,
-            api_key=api_key,
-        )
-        agent.start(prompt)
-
-        with self._lock:
+            # 创建新会话 (在锁内创建并注册，防止并发双创建)
+            logger.info("[%s] create new AgentProcess", sid)
+            agent = AgentProcess(
+                session_id=sid,
+                workspace=os.path.abspath(workspace),
+                model=model,
+                mode=mode,
+                api_key=api_key,
+            )
             self._sessions[sid] = agent
 
+        # start() 可能耗时（清理孤儿、写 prompt），在锁外执行
+        agent.start(prompt)
         self._save_session_meta(agent)
         logger.info(
             "[%s] new session ready: pid=%s workspace=%s model=%s",
@@ -222,8 +220,8 @@ class SessionManager:
     def stop(self) -> None:
         """停止所有"""
         self._running = False
+        self._stop_event.set()
         logger.info("SessionManager stop called: cleanup thread stop requested")
-        # 不杀 Agent — 它们会继续后台运行直到空闲超时
 
     def stop_and_kill_all(self) -> None:
         """停止并杀死所有 Agent"""
@@ -246,7 +244,8 @@ class SessionManager:
     def _cleanup_loop(self) -> None:
         """定期检查并清理空闲超时的 session"""
         while self._running:
-            time.sleep(300)  # 每 5 分钟检查
+            if self._stop_event.wait(timeout=300):
+                break
             logger.debug("cleanup loop tick: begin idle-session scan")
             self._cleanup_idle_sessions()
 
@@ -280,7 +279,11 @@ class SessionManager:
     # ---- 持久化元数据 ----
 
     def _save_session_meta(self, agent: AgentProcess) -> None:
-        """保存 session 元数据 (用于恢复)"""
+        """保存 session 元数据 (用于恢复)
+
+        Uses atomic write-to-temp + rename to prevent corruption
+        if the process is killed mid-write.
+        """
         meta = {
             "session_id": agent.session_id,
             "workspace": agent.workspace,
@@ -293,11 +296,19 @@ class SessionManager:
         }
         meta_file = SESSION_DB_DIR / f"{agent.session_id}.json"
         try:
-            with open(meta_file, "w") as f:
+            fd, tmp_path = tempfile.mkstemp(
+                dir=str(SESSION_DB_DIR), suffix=".tmp", prefix=".meta_"
+            )
+            with os.fdopen(fd, "w") as f:
                 json.dump(meta, f, indent=2)
+            os.replace(tmp_path, str(meta_file))
             logger.debug("[%s] session meta saved: %s", agent.session_id, meta_file)
         except Exception as e:
             logger.warning("保存 session 元数据失败: %s", e)
+            try:
+                os.unlink(tmp_path)
+            except (OSError, NameError):
+                pass
 
     def _remove_session_meta(self, session_id: str) -> None:
         meta_file = SESSION_DB_DIR / f"{session_id}.json"

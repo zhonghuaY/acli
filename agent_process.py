@@ -401,13 +401,25 @@ def _quote(s: str) -> str:
 
 
 def _read_proc_start_ticks(pid: int) -> Optional[int]:
-    """读取 /proc/<pid>/stat 的 starttime ticks（Linux）。"""
+    """读取 /proc/<pid>/stat 的 starttime ticks（Linux）。
+
+    进程名 (field 2) 可能包含空格和括号，所以必须找到最后一个 ')' 
+    再从其后开始解析，否则字段索引会偏移。
+    """
     try:
         with open(f"/proc/{pid}/stat", "r", encoding="utf-8") as f:
-            stat_fields = f.read().split()
-        if len(stat_fields) < 22:
+            data = f.read()
+        # field 2 (comm) is enclosed in parentheses and may contain spaces
+        close_paren = data.rfind(")")
+        if close_paren < 0:
             return None
-        return int(stat_fields[21])
+        # fields after comm start at index close_paren+2 (skip ") ")
+        rest_fields = data[close_paren + 2:].split()
+        # starttime is field 22 in 1-indexed /proc/stat, which is index 19
+        # after stripping pid(1) and comm(2): field 22 - 3 = index 19
+        if len(rest_fields) < 20:
+            return None
+        return int(rest_fields[19])
     except (OSError, ValueError, IndexError):
         return None
 
