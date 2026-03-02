@@ -1,0 +1,5 @@
+# acli - no external dependencies, Python standard library only
+# Python >= 3.9
+#
+# Runtime dependency:
+# - Cursor Agent CLI (~/.local/bin/agent)
