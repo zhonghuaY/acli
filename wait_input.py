@@ -37,9 +37,9 @@ ipc_dir.mkdir(parents=True, exist_ok=True)
 
 marker_file = ipc_dir / f"{IPC_PREFIX}waiting_{session}.marker"
 
-logger.info(f"等待脚本启动: session={session} timeout={timeout}s")
-logger.info(f"IPC 目录: {ipc_dir}")
-logger.info(f"标记文件: {marker_file}")
+logger.info("等待脚本启动: session=%s timeout=%ss", session, timeout)
+logger.info("IPC 目录: %s", ipc_dir)
+logger.info("标记文件: %s", marker_file)
 logger.info(
     "运行上下文: pid=%s ppid=%s cwd=%s backend=sqlite poll=%.3fs trace_every=%s",
     os.getpid(),
@@ -67,11 +67,12 @@ def _cleanup_waiting(reason: str) -> None:
         logger.warning("删除标记文件失败: %s", e)
 
 
+_shutdown_requested: int = 0
+
+
 def _handle_signal(signum: int, _frame) -> None:
-    sig_name = signal.Signals(signum).name
-    logger.warning("收到信号，准备退出: signal=%s(%s)", signum, sig_name)
-    _cleanup_waiting(f"signal:{sig_name}")
-    sys.exit(128 + signum)
+    global _shutdown_requested
+    _shutdown_requested = signum
 
 
 for _sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
@@ -82,23 +83,24 @@ for _sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
 
 # 标记等待状态 (关键：这个文件的出现 = Agent 进入等待状态)
 try:
-    with open(marker_file, "w") as f:
+    fd = os.open(str(marker_file), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
         json.dump({
             "status": "waiting",
             "time": time.strftime("%Y-%m-%d %H:%M:%S"),
             "session": session,
             "pid": os.getpid(),
         }, f)
-    logger.info(f"标记文件已创建: {marker_file}")
+    logger.info("标记文件已创建: %s", marker_file)
 except OSError as e:
-    logger.error(f"创建标记文件失败: {e}")
+    logger.error("创建标记文件失败: %s", e)
     print("[MARKER_CREATE_FAILED]")
     sys.exit(1)
 
 try:
     set_waiting_state(session, os.getpid())
 except Exception as e:
-    logger.error(f"写入 waiting_state 失败: {e}")
+    logger.error("写入 waiting_state 失败: %s", e)
     print("[WAITING_STATE_FAILED]")
     sys.exit(1)
 
@@ -108,6 +110,12 @@ poll_interval = POLL_INPUT
 check_count = 0
 
 while waited < timeout:
+    if _shutdown_requested:
+        sig_name = signal.Signals(_shutdown_requested).name
+        logger.warning("处理延迟信号退出: signal=%s(%s)", _shutdown_requested, sig_name)
+        _cleanup_waiting(f"signal:{sig_name}")
+        sys.exit(128 + _shutdown_requested)
+
     check_count += 1
     if check_count % trace_every == 0:
         logger.debug(
@@ -121,11 +129,11 @@ while waited < timeout:
     try:
         content = dequeue_input(session)
     except Exception as e:
-        logger.warning(f"读取 SQLite 队列失败: {e}")
+        logger.warning("读取 SQLite 队列失败: %s", e)
         content = None
 
     if content is not None:
-        logger.info(f"从 SQLite 队列读取输入: {len(content)} 字节 (第 {check_count} 次检查)")
+        logger.info("从 SQLite 队列读取输入: %s 字节 (第 %s 次检查)", len(content), check_count)
         _cleanup_waiting("sqlite_input_ready")
 
         print(content, end='')
@@ -135,12 +143,11 @@ while waited < timeout:
     time.sleep(poll_interval)
     waited += poll_interval
     
-    # 每秒日志一次进度（额外摘要）
     if check_count % 20 == 0:
-        logger.debug(f"等待中... {int(waited)}s / {timeout}s")
+        logger.debug("等待中... %ss / %ss", int(waited), timeout)
 
 # 超时
-logger.error(f"等待超时: {timeout}s 内未收到输入")
+logger.error("等待超时: %ss 内未收到输入", timeout)
 _cleanup_waiting("timeout")
 
 print("[SESSION_TIMEOUT]")

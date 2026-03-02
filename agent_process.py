@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import os
+import shlex
 import signal
 import subprocess
 import time
@@ -70,18 +71,18 @@ class AgentProcess:
         )
         
         # 清理旧孤儿进程（确保没有竞争）
-        logger.info(f"[{session_id}] 清理孤儿进程...")
+        logger.info("[%s] 清理孤儿进程...", session_id)
         killed = kill_orphan_agents(session_id)
         if killed > 0:
-            logger.info(f"[{session_id}] 清理了 {killed} 个孤儿进程")
+            logger.info("[%s] 清理了 %s 个孤儿进程", session_id, killed)
             time.sleep(0.5)  # 等待进程完全退出
 
         # 清理旧 IPC 文件
-        logger.info(f"[{session_id}] 清理旧 IPC 文件...")
+        logger.info("[%s] 清理旧 IPC 文件...", session_id)
         self.files.cleanup()
 
         # 构建持久化 prompt
-        logger.debug(f"[{session_id}] wait_script: {self.wait_script}")
+        logger.debug("[%s] wait_script: %s", session_id, self.wait_script)
         first_prompt = self._with_second_reminder(prompt)
         
         full_prompt = PERSISTENT_PROMPT_TEMPLATE.format(
@@ -93,7 +94,7 @@ class AgentProcess:
         )
 
         self.files.write_prompt(full_prompt)
-        logger.debug(f"[{session_id}] Prompt 已写入: {self.files.prompt_file}")
+        logger.debug("[%s] Prompt 已写入: %s", session_id, self.files.prompt_file)
 
         # 构建命令
         args = [
@@ -139,8 +140,8 @@ class AgentProcess:
         self.read_pos = 0
         self.process_start_ticks = _read_proc_start_ticks(self.pid) or 0
 
-        logger.info(f"[{session_id}] Agent 进程已启动: pid={self.pid} model={self.model}")
-        logger.debug(f"[{session_id}] IPC 文件路径: output={self.files.output_file}")
+        logger.info("[%s] Agent 进程已启动: pid=%s model=%s", session_id, self.pid, self.model)
+        logger.debug("[%s] IPC 文件路径: output=%s", session_id, self.files.output_file)
         logger.debug(
             "[%s] process identity: start_ticks=%s created_at=%.3f",
             session_id,
@@ -192,13 +193,13 @@ class AgentProcess:
                 logger.warning("[%s] SIGTERM failed pid=%s err=%s", self.session_id, self.proc.pid, e)
             try:
                 self.proc.wait(timeout=3)
-                logger.info(f"Agent 进程 {self.proc.pid} 已通过 SIGTERM 终止")
+                logger.info("Agent 进程 %s 已通过 SIGTERM 终止", self.proc.pid)
             except subprocess.TimeoutExpired:
                 # 第二阶段：SIGKILL 强制杀死
                 try:
                     logger.warning("[%s] kill phase2 SIGKILL pid=%s", self.session_id, self.proc.pid)
                     os.kill(self.proc.pid, signal.SIGKILL)
-                    logger.warning(f"Agent 进程 {self.proc.pid} 已通过 SIGKILL 强制终止")
+                    logger.warning("Agent 进程 %s 已通过 SIGKILL 强制终止", self.proc.pid)
                 except (ProcessLookupError, PermissionError, OSError) as e:
                     logger.warning("[%s] SIGKILL failed pid=%s err=%s", self.session_id, self.proc.pid, e)
         elif self.pid > 0:
@@ -217,7 +218,7 @@ class AgentProcess:
         # 也清理对应 session 的孤儿
         kill_orphan_agents(self.session_id)
         self.files.cleanup()
-        logger.info(f"Agent 已终止: session={self.session_id}")
+        logger.info("Agent 已终止: session=%s", self.session_id)
 
     # ---- 状态 ----
 
@@ -336,22 +337,22 @@ def kill_orphan_agents(session_id: str = "") -> int:
     """
     killed = 0
     my_pid = os.getpid()
+    wait_script_path = str(Path(__file__).parent / "wait_input.py")
 
     patterns = []
     if session_id:
-        # 当前项目的 acli_ 前缀
-        patterns.append(f"{IPC_PREFIX}.*{session_id}")
-        patterns.append(f"wait_input.py.*{session_id}")
+        patterns.append(f"{IPC_PREFIX}prompt_{session_id}")
+        patterns.append(f"{wait_script_path} {session_id}")
     else:
-        # 清理所有 acli 进程
         patterns.append(f"{IPC_PREFIX}prompt_")
-        patterns.append(f"wait_input.py.*{IPC_PREFIX[:-1]}")
+        patterns.append(f"{wait_script_path} {IPC_PREFIX[:-1]}")
 
     for pattern in patterns:
         logger.debug("orphan scan pattern: %s", pattern)
         try:
             result = subprocess.run(
-                ["pgrep", "-f", pattern],
+                ["pgrep", "-f", "--exact" if session_id else "-f", pattern]
+                if not session_id else ["pgrep", "-f", pattern],
                 capture_output=True, text=True, timeout=5,
             )
             if result.returncode == 0:
@@ -360,6 +361,10 @@ def kill_orphan_agents(session_id: str = "") -> int:
                         continue
                     pid = int(line.strip())
                     if pid == my_pid:
+                        continue
+                    # Verify the matched process is really ours by checking /proc cmdline
+                    if not _verify_orphan_process(pid, pattern):
+                        logger.debug("orphan skip non-matching pid=%s pattern=%s", pid, pattern)
                         continue
                     try:
                         logger.info("orphan kill SIGTERM: pid=%s pattern=%s", pid, pattern)
@@ -374,17 +379,25 @@ def kill_orphan_agents(session_id: str = "") -> int:
             continue
 
     if killed > 0:
-        logger.info(f"清理孤儿进程: session={session_id or 'all'}, killed={killed}")
+        logger.info("清理孤儿进程: session=%s killed=%s", session_id or "all", killed)
         time.sleep(0.3)
 
     return killed
 
 
+def _verify_orphan_process(pid: int, pattern: str) -> bool:
+    """Double-check via /proc that the PID is an acli-related process."""
+    try:
+        with open(f"/proc/{pid}/cmdline", "r") as f:
+            cmdline = f.read().replace("\0", " ")
+        return "wait_input.py" in cmdline or "acli_prompt_" in cmdline or "agent" in cmdline
+    except (OSError, PermissionError):
+        return False
+
+
 def _quote(s: str) -> str:
-    """Shell-safe quoting"""
-    if " " in s or "'" in s or '"' in s or "$" in s:
-        return f'"{s}"'
-    return s
+    """Shell-safe quoting using shlex to prevent injection."""
+    return shlex.quote(s)
 
 
 def _read_proc_start_ticks(pid: int) -> Optional[int]:

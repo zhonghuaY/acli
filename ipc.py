@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import sqlite3
+import threading
 import time
 from pathlib import Path
 from typing import Generator, Optional
@@ -29,17 +30,28 @@ from config import (
 
 logger = logging.getLogger("acli.ipc")
 
-IPC_DIR.mkdir(parents=True, exist_ok=True)
+IPC_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
 SQLITE_DB_FILE = IPC_DIR / f"{IPC_PREFIX}ipc.sqlite3"
 _DB_READY = False
+_thread_local = threading.local()
 
 
 def _db_connect() -> sqlite3.Connection:
+    """Thread-local cached SQLite connection to avoid per-call open/close overhead."""
+    conn = getattr(_thread_local, "conn", None)
+    if conn is not None:
+        try:
+            conn.execute("SELECT 1")
+            return conn
+        except (sqlite3.Error, sqlite3.ProgrammingError):
+            _thread_local.conn = None
+
     logger.debug("open sqlite connection: file=%s", SQLITE_DB_FILE)
     conn = sqlite3.connect(str(SQLITE_DB_FILE), timeout=30.0, isolation_level=None)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA busy_timeout=30000")
+    _thread_local.conn = conn
     return conn
 
 
@@ -113,8 +125,6 @@ def dequeue_input(session_id: str) -> Optional[str]:
             pass
         logger.error("[%s] dequeue_input failed: %s", session_id, e)
         raise
-    finally:
-        conn.close()
 
 
 def set_waiting_state(session_id: str, pid: int) -> None:
@@ -150,23 +160,20 @@ def clear_waiting_state(session_id: str, pid: Optional[int] = None) -> None:
 def is_waiting_state(session_id: str) -> bool:
     _ensure_db()
     conn = _db_connect()
-    try:
-        row = conn.execute(
-            "SELECT pid FROM waiting_state WHERE session_id = ?",
-            (session_id,),
-        ).fetchone()
-        if not row:
-            logger.debug("[%s] is_waiting_state: no row", session_id)
-            return False
-        pid = row[0]
-        if isinstance(pid, int) and _pid_alive(pid):
-            logger.debug("[%s] is_waiting_state: true pid=%s", session_id, pid)
-            return True
-        conn.execute("DELETE FROM waiting_state WHERE session_id = ?", (session_id,))
-        logger.info("[%s] is_waiting_state stale row removed: pid=%s", session_id, pid)
+    row = conn.execute(
+        "SELECT pid FROM waiting_state WHERE session_id = ?",
+        (session_id,),
+    ).fetchone()
+    if not row:
+        logger.debug("[%s] is_waiting_state: no row", session_id)
         return False
-    finally:
-        conn.close()
+    pid = row[0]
+    if isinstance(pid, int) and _pid_alive(pid):
+        logger.debug("[%s] is_waiting_state: true pid=%s", session_id, pid)
+        return True
+    conn.execute("DELETE FROM waiting_state WHERE session_id = ?", (session_id,))
+    logger.info("[%s] is_waiting_state stale row removed: pid=%s", session_id, pid)
+    return False
 
 
 def cleanup_session_state(session_id: str) -> None:
@@ -251,7 +258,7 @@ class SessionFiles:
     def send_input(self, text: str) -> None:
         """写入后续轮指令到 SQLite 输入队列 (wait_input.py 会读取)。"""
         enqueue_input(self.session_id, text)
-        logger.info(f"[{self.session_id}] 输入已入队(SQLite): {len(text)} 字节")
+        logger.info("[%s] 输入已入队(SQLite): %s 字节", self.session_id, len(text))
 
     def cleanup(self) -> None:
         """清理所有 IPC 文件"""
@@ -370,7 +377,7 @@ class SessionFiles:
 
                             # 检测 wait_input.py started = 本轮结束
                             if ev_type == "tool_call" and ev_sub == "started":
-                                cmd = _extract_tool_command(ev)
+                                cmd = extract_tool_command(ev)
                                 if "wait_input.py" in cmd:
                                     call_id = ev.get("call_id")
                                     # 网络重连可能回放同一 call_id 的 started 事件。
@@ -444,6 +451,13 @@ class SessionFiles:
 def cleanup_all_ipc_files() -> int:
     """清理所有 acli IPC 临时文件，返回清理数量"""
     global _DB_READY
+    conn = getattr(_thread_local, "conn", None)
+    if conn is not None:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        _thread_local.conn = None
     count = 0
     logger.info("cleanup_all_ipc_files start: dir=%s backend=sqlite", IPC_DIR)
     for pattern in [
@@ -478,7 +492,7 @@ def cleanup_all_ipc_files() -> int:
     return count
 
 
-def _extract_tool_command(ev: dict) -> str:
+def extract_tool_command(ev: dict) -> str:
     """从 tool_call 事件中提取 shell command"""
     tc = ev.get("tool_call", {})
     for k, v in tc.items():

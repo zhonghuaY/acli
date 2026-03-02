@@ -27,6 +27,7 @@ from typing import Optional
 from config import Color, AGENT_CLI, DEFAULT_MODEL, SKILL_DIRS, MODEL_ALIASES, resolve_model
 from session_manager import SessionManager, make_session_id
 from agent_process import AgentProcess
+from ipc import extract_tool_command
 
 logger = logging.getLogger("acli.repl")
 
@@ -558,27 +559,23 @@ def render_agent_output(agent: AgentProcess, show_thinking: bool = True) -> str:
 
 
 def _is_cumulative(txt: str, accumulated: str) -> bool:
-    """检测是否为累积全文事件"""
+    """检测是否为累积全文事件（Agent CLI 有时发送完整文本而非增量 delta）。
+
+    判定逻辑：如果新 txt 是已累积文本的前缀或完整匹配，则为累积事件。
+    仅当 txt 长度 >= accumulated 的 80% 时才触发（排除恰好重叠的短增量）。
+    """
     if not accumulated:
         return False
     if txt == accumulated:
         return True
-    if len(accumulated) >= 10 and len(txt) >= len(accumulated) * 0.5:
-        prefix_len = min(8, len(accumulated), len(txt))
-        if txt[:prefix_len] == accumulated[:prefix_len]:
-            return True
+    if len(txt) >= len(accumulated) * 0.8 and accumulated.startswith(txt):
+        return True
+    if len(txt) > len(accumulated) and txt.startswith(accumulated):
+        return True
     return False
 
 
-def _extract_cmd(ev: dict) -> str:
-    """从 tool_call 事件提取命令"""
-    tc = ev.get("tool_call", {})
-    for k, v in tc.items():
-        if isinstance(v, dict):
-            cmd = v.get("args", {}).get("command", "")
-            if cmd:
-                return cmd
-    return ""
+_extract_cmd = extract_tool_command
 
 
 # ========== REPL 主循环 ==========

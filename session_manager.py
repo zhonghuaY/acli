@@ -92,27 +92,36 @@ class SessionManager:
                     agent.idle_seconds,
                 )
                 if agent.is_waiting:
-                    # 空闲, 直接发送
                     agent.send_input(prompt)
                     self._save_session_meta(agent)
                     return agent
 
-                # 忙碌也直接入队，避免固定超时导致误判重启。
-                logger.info("[%s] 会话忙碌, 直接入队下一轮消息", sid)
+                # Agent 忙碌：先推进 read_pos 到文件末尾，跳过上轮残留输出，
+                # 避免 render_agent_output 显示上一轮的尾巴。
+                try:
+                    if os.path.exists(agent.files.output_file):
+                        old_pos = agent.read_pos
+                        agent.read_pos = os.path.getsize(agent.files.output_file)
+                        logger.info(
+                            "[%s] busy: advanced read_pos %s -> %s to skip stale output",
+                            sid, old_pos, agent.read_pos,
+                        )
+                except OSError as e:
+                    logger.warning("[%s] busy: failed to advance read_pos: %s", sid, e)
                 agent.send_input(prompt)
                 self._save_session_meta(agent)
                 return agent
 
             elif agent:
                 # 进程已死, 需要重启
-                logger.info(f"[{sid}] Agent 进程已退出, 重启")
+                logger.info("[%s] Agent 进程已退出, 重启", sid)
                 agent.files.cleanup()
                 agent = None
             else:
-                logger.debug(f"[{sid}] no existing session, will create new")
+                logger.debug("[%s] no existing session, will create new", sid)
 
         # 创建新会话
-        logger.info(f"[{sid}] create new AgentProcess")
+        logger.info("[%s] create new AgentProcess", sid)
         agent = AgentProcess(
             session_id=sid,
             workspace=os.path.abspath(workspace),
@@ -257,7 +266,7 @@ class SessionManager:
                 if not agent.is_alive:
                     to_remove.append(sid)
                 elif agent.idle_seconds > SESSION_IDLE_TIMEOUT_SECS:
-                    logger.info(f"[{sid}] 空闲超时 ({agent.idle_seconds/3600:.1f}h), 清理")
+                    logger.info("[%s] 空闲超时 (%.1fh), 清理", sid, agent.idle_seconds / 3600)
                     agent.kill()
                     to_remove.append(sid)
             for sid in to_remove:
@@ -288,7 +297,7 @@ class SessionManager:
                 json.dump(meta, f, indent=2)
             logger.debug("[%s] session meta saved: %s", agent.session_id, meta_file)
         except Exception as e:
-            logger.warning(f"保存 session 元数据失败: {e}")
+            logger.warning("保存 session 元数据失败: %s", e)
 
     def _remove_session_meta(self, session_id: str) -> None:
         meta_file = SESSION_DB_DIR / f"{session_id}.json"
@@ -333,21 +342,24 @@ class SessionManager:
                     meta_file.unlink(missing_ok=True)
                     continue
 
-                # 检查 IPC 文件
-                if os.path.exists(agent.files.output_file):
-                    agent.read_pos = os.path.getsize(agent.files.output_file)
-                    logger.debug("[%s] restore read_pos from output size: %s", sid, agent.read_pos)
+                # 恢复时跳到文件末尾，避免重放旧轮次输出
+                try:
+                    if os.path.exists(agent.files.output_file):
+                        agent.read_pos = os.path.getsize(agent.files.output_file)
+                        logger.debug("[%s] restore read_pos from output size: %s", sid, agent.read_pos)
+                except OSError as e:
+                    logger.warning("[%s] restore read_pos failed: %s", sid, e)
 
                 self._sessions[sid] = agent
                 restored += 1
                 logger.info("[%s] restore success: pid=%s workspace=%s model=%s", sid, pid, agent.workspace, agent.model)
 
             except (json.JSONDecodeError, KeyError, Exception) as e:
-                logger.warning(f"恢复 session 失败 ({meta_file.name}): {e}")
+                logger.warning("恢复 session 失败 (%s): %s", meta_file.name, e)
                 try:
                     meta_file.unlink()
                 except OSError:
                     pass
 
         if restored > 0:
-            logger.info(f"恢复了 {restored} 个 session")
+            logger.info("恢复了 %s 个 session", restored)
